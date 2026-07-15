@@ -46,6 +46,14 @@ impl Tensor {
         }
     }
 
+    pub fn from_vec(data: Vec<f64>, rows: usize, columns: usize) -> Tensor {
+        Tensor {
+            data,
+            rows,
+            columns,
+        }
+    }
+
     pub fn map_data(&self, f: impl FnMut(&f64) -> f64) -> Tensor {
         Tensor {
             data: self.data.iter().map(f).collect(),
@@ -134,6 +142,13 @@ impl Tensor {
             columns: self.rows,
         }
     }
+
+    /// Apply a gradient-descent step in-place to the given Tensor.
+    pub fn gradient_descent(&mut self, grad: &Tensor, learning_rate: f64) {
+        for (p, g) in self.data.iter_mut().zip(grad.data.iter()) {
+            *p -= learning_rate * g;
+        }
+    }
 }
 
 /// One entry on the tape.
@@ -190,6 +205,11 @@ impl Value {
         self.tape.nodes.borrow()[self.idx].data.clone()
     }
 
+    /// Read the forward value at the provided index.
+    pub fn data_at(&self, idx: usize) -> f64 {
+        self.tape.nodes.borrow()[self.idx].data.data[idx]
+    }
+    
     /// Apply the following function to each data entry of the current forward value and return
     /// the resulting tensor.
     pub fn map_data(&self, f: impl FnMut(&f64) -> f64) -> Tensor {
