@@ -19,7 +19,14 @@ enum Op {
     /// A leaf: created directly, not from other nodes (e.g. an input or weight).
     Leaf,
     Add(usize, usize),
+    /// Add a bias (which is a single row) to a matrix with a matching number of columns.
+    /// The bias is simply added to every row.
+    AddBias(usize, usize),
     Mul(usize, usize),
+    /// Reduce a tensor to a single scalar value by summing up all of its elements and multiplies
+    /// the result by the provided scalar. This is useful to compute the error of a training step
+    /// when using batching.
+    SumToScalar(usize, f64),
     /// x^exponent, where exponent is a constant (not a tracked Value).
     Pow(usize, f64),
     Exp(usize),
@@ -32,9 +39,9 @@ enum Op {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Tensor {
     /// We store the tensor data as a flattened vector (rows are concatenated).
-    data: Vec<f64>,
-    rows: usize,
-    columns: usize,
+    pub data: Vec<f64>,
+    pub rows: usize,
+    pub columns: usize,
 }
 
 impl Tensor {
@@ -75,6 +82,19 @@ impl Tensor {
             rows: self.rows,
             columns: self.columns,
         }
+    }
+
+    pub fn add_bias(&self, bias: &Tensor) -> Tensor {
+        assert_eq!(bias.rows, 1);
+        assert_eq!(self.columns, bias.columns);
+        let mut out = self.data.clone();
+        for r in 0..self.rows {
+            for c in 0..self.columns {
+                // We add the same bias to every row of the tensor.
+                out[r * self.columns + c] += bias.data[c];
+            }
+        }
+        Tensor::from_vec(out, self.rows, self.columns)
     }
 
     pub fn sub(&self, other: &Tensor) -> Tensor {
@@ -209,7 +229,7 @@ impl Value {
     pub fn data_at(&self, idx: usize) -> f64 {
         self.tape.nodes.borrow()[self.idx].data.data[idx]
     }
-    
+
     /// Apply the following function to each data entry of the current forward value and return
     /// the resulting tensor.
     pub fn map_data(&self, f: impl FnMut(&f64) -> f64) -> Tensor {
@@ -233,6 +253,13 @@ impl Value {
         self.op(self.data().add(&other.data()), Op::Add(self.idx, other.idx))
     }
 
+    pub fn add_bias(&self, bias: &Value) -> Value {
+        self.op(
+            self.data().add_bias(&bias.data()),
+            Op::AddBias(self.idx, bias.idx),
+        )
+    }
+
     pub fn mul(&self, other: &Value) -> Value {
         self.op(
             self.data().matmul(&other.data()),
@@ -245,6 +272,14 @@ impl Value {
         // This ensures that gradients flow through both operations correctly.
         let neg = other.neg();
         self.add(&neg)
+    }
+
+    pub fn sum_to_scalar(&self, scaling: f64) -> Value {
+        let res: f64 = self.data().data.iter().sum();
+        self.op(
+            Tensor::from_vec(vec![res * scaling], 1, 1),
+            Op::SumToScalar(self.idx, scaling),
+        )
     }
 
     pub fn neg(&self) -> Value {
@@ -305,10 +340,40 @@ impl Value {
                     nodes[a].grad = nodes[a].grad.add(&g);
                     nodes[b].grad = nodes[b].grad.add(&g);
                 }
+                Op::AddBias(a, bias) => {
+                    // We just add the gradient, like we do for a normal add operation.
+                    nodes[a].grad = nodes[a].grad.add(&g);
+                    // But for the bias gradient, we must sum the incoming gradient from each row
+                    // (we "reduce" the expansion we made when adding the bias to each row in the
+                    // forward pass, because the bias influenced every row in the forward pass).
+                    let cols = g.columns;
+                    let mut bias_grad = vec![0.0; cols];
+                    for r in 0..g.rows {
+                        for c in 0..cols {
+                            bias_grad[c] += g.data[r * cols + c];
+                        }
+                    }
+                    nodes[bias].grad = nodes[bias].grad.add(&Tensor::from_vec(bias_grad, 1, cols));
+                }
                 Op::Mul(a, b) => {
                     // dA = d(A*B) * T(B), dB = T(A) * d(A*B)
                     nodes[a].grad = nodes[a].grad.add(&g.matmul(&nodes[b].data.transpose()));
                     nodes[b].grad = nodes[b].grad.add(&nodes[a].data.transpose().matmul(&g));
+                }
+                Op::SumToScalar(a, scaling) => {
+                    // We've reduced to a scalar value, so both dimensions of the gradient are 1.
+                    assert_eq!(g.rows, 1);
+                    assert_eq!(g.columns, 1);
+                    // We've computed: out = scaling × (a₁ + a₂ + … + aₙ)
+                    // d(loss)/d(aᵢ) = d(loss)/d(out) × d(out)/d(aᵢ)
+                    // d(out)/d(aᵢ) = scaling so we just need to uniformly apply to each element.
+                    let grad_val = g.data[0] * scaling;
+                    let broadcast = Tensor::from_vec(
+                        vec![grad_val; nodes[a].grad.rows * nodes[a].grad.columns],
+                        nodes[a].grad.rows,
+                        nodes[a].grad.columns,
+                    );
+                    nodes[a].grad = nodes[a].grad.add(&broadcast);
                 }
                 Op::Pow(a, p) => {
                     // d/da (a^p) = p * a^(p-1)
@@ -611,6 +676,35 @@ mod tests {
         compare_multi_var_numeric_grad(|t, a, b| build(t, a, b).0, &a0, &b0, 1e-6, &ga, &gb);
     }
 
+    #[test]
+    fn multi_var_add_bias_graph() {
+        // Build the basic expression that adds a bias to multiple rows.
+        let build = |t: &Tape, a: Tensor, bias: Tensor| -> (Value, Value, Value) {
+            let av = t.value(a);
+            let biasv = t.value(bias);
+            let out = av.add_bias(&biasv);
+            (out, av, biasv)
+        };
+        let a0 = Tensor {
+            data: vec![1.5, -0.5, 0.3, 2.0, -0.4, 0.6],
+            rows: 3,
+            columns: 2,
+        };
+        let bias0 = Tensor {
+            data: vec![0.3, -0.1],
+            rows: 1,
+            columns: 2,
+        };
+        // Compute gradients using the tape.
+        let tape = Tape::new();
+        let (out, a, b) = build(&tape, a0.clone(), bias0.clone());
+        out.backward();
+        let ga = a.grad();
+        let gbias = b.grad();
+        // Compute numeric gradients for comparison.
+        compare_multi_var_numeric_grad(|t, a, b| build(t, a, b).0, &a0, &bias0, 1e-6, &ga, &gbias);
+    }
+
     /// Numerically estimate d(out)/d(input) using central finite differences with regards to each
     /// element of the tensor.
     fn compare_single_var_numeric_grad<F>(f: F, a0: &Tensor, eps: f64, analytic: &Tensor) -> ()
@@ -674,6 +768,28 @@ mod tests {
             let av = t.value(a.clone());
             let e = av.exp();
             let out = e.add(&av).log();
+            (out, av)
+        };
+        let a0 = Tensor {
+            data: vec![1.73, 0.81, 0.64, 1.32, 2.13, 0.27],
+            rows: 3,
+            columns: 2,
+        };
+
+        // Compute gradients using the tape.
+        let t = Tape::new();
+        let (f, a) = build(&t, a0.clone());
+        f.backward();
+        let analytic = a.grad();
+        // Compute numeric gradients for comparison.
+        compare_single_var_numeric_grad(|t, a| build(t, a).0, &a0, 1e-6, &analytic);
+    }
+
+    #[test]
+    fn single_var_reduce_to_scalar() {
+        let build = |t: &Tape, a: Tensor| -> (Value, Value) {
+            let av = t.value(a.clone());
+            let out = av.sum_to_scalar(1.0 / ((a.rows * a.columns) as f64));
             (out, av)
         };
         let a0 = Tensor {

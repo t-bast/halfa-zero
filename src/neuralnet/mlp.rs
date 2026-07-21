@@ -64,15 +64,17 @@ impl<F: Fn(Value) -> Value> Mlp<F> {
         Mlp { layers, activation }
     }
 
-    /// Build the forward graph for a single input on a fresh tape, returning the parameter leaf
+    /// Build the forward graph for a batch of inputs on a fresh tape, returning the parameter leaf
     /// values (so that we can read their gradients afterwards) and the output value.
     ///
-    /// `input` is shape [1, in_dim] (batch = 1). Each layer computes:
+    /// Training on batches of inputs (instead of providing a single input at each training step)
+    /// has several benefits. First of all, it's more efficient (from a pure matrix multiplication
+    /// point of view). Then, it's also more efficient for the gradient descent step: averaging the
+    /// gradient over a batch of inputs reduces the loss jitter.
+    ///
+    /// `input` has shape [batch, in_dim]. Each layer computes:
     ///     h = activation( x . W + b )      for hidden layers (non-linear activation)
     ///     y = x . W + b                    for the final (linear) layer
-    ///
-    /// TODO: add support for batching ([batch, in_dim] inputs), which will require bias
-    ///     broadcasting (figure out what that means and why it's necessary).
     fn forward(&self, tape: &Tape, input: Tensor) -> (Vec<(Value, Value)>, Value) {
         // We store the (weight, bias) pair of each layer and return them to allow the backward
         // step to read their gradients.
@@ -83,7 +85,7 @@ impl<F: Fn(Value) -> Value> Mlp<F> {
         for (i, layer) in self.layers.iter().enumerate() {
             let w = tape.value(layer.w.clone());
             let b = tape.value(layer.b.clone());
-            let pre = x.mul(&w).add(&b); // x . W + b
+            let pre = x.mul(&w).add_bias(&b); // x . W + b
             x = if i == last {
                 pre
             } else {
@@ -94,22 +96,33 @@ impl<F: Fn(Value) -> Value> Mlp<F> {
         (params, x)
     }
 
-    /// Perform one full training step on a single (input, target) example.
+    /// Perform one full training step on a batch of (input, target) examples.
     ///
-    /// Returns the loss value (for logging/debugging).
+    /// Returns the averaged loss value (for logging/debugging).
     /// If the loss explodes or oscillates wildly, the learning rate may be too high.
     /// If the loss improves too slowly, the learning rate may be too low.
-    pub fn train_step(&mut self, input_value: f64, target_value: f64, learning_rate: f64) -> f64 {
+    pub fn train_step(
+        &mut self,
+        input_values: Tensor,
+        target_values: Tensor,
+        learning_rate: f64,
+    ) -> f64 {
+        assert_eq!(input_values.rows, target_values.rows);
         let tape = Tape::new();
-        let input = Tensor::from_vec(vec![input_value], 1, 1);
-        let (params, prediction) = self.forward(&tape, input);
+        // We support batching multiple inputs in the same training step.
+        let batch = input_values.rows;
+        let (params, prediction) = self.forward(&tape, input_values);
 
         // We compute the mean squared error (loss function), reduced to a single scalar.
-        let target = tape.value(Tensor::from_vec(vec![target_value], 1, 1));
+        let out_dim = target_values.columns;
+        let target = tape.value(target_values);
         let diff = prediction.sub(&target);
-        let loss = diff.powf(2.0);
-        // The loss is a [1, 1] matrix (a scalar), so we can directly apply backward() step on it.
-        // This modifies the tape by computing the gradients on each node.
+        let batch_loss = diff.powf(2.0); // [batch, out_dim] matrix
+        // We reduce the loss across both dimensions (batch and output dimension) by taking the
+        // mean of each individual loss value.
+        let loss = batch_loss.sum_to_scalar(1.0 / ((batch * out_dim) as f64));
+        // We can now apply the backward() step, which modifies the tape by computing the gradients
+        // on each node.
         loss.backward();
 
         // Gradient-descent step: read each leaf's gradient and nudge the network's weights and biases.
@@ -123,11 +136,10 @@ impl<F: Fn(Value) -> Value> Mlp<F> {
 
     /// Run the network on one input (no training) to inspect results for a 1-input, 1-output
     /// network.
-    pub fn predict(&self, x: f64) -> f64 {
+    pub fn predict(&self, x: Tensor) -> Tensor {
         let tape = Tape::new();
-        let input = Tensor::from_vec(vec![x], 1, 1);
-        let (_, out) = self.forward(&tape, input);
-        out.data_at(0)
+        let (_, out) = self.forward(&tape, x);
+        out.data()
     }
 }
 
@@ -141,12 +153,12 @@ mod tests {
         // We train a basic neural network to fit the function y=sin(x).
         // Network: 1 -> 16 -> 16 -> 1, using tanh as the activation function.
         let mut net = Mlp::new(&[1, 16, 16, 1], |v| v.tanh());
-        let learning_rate = 0.01;
+        let learning_rate = 0.02;
 
         // Training data: we sample sin over [-pi, pi] and normalize the input by pi so it lands
         // in [-1, 1], which works better with the tanh activation function.
         let n: usize = 64;
-        let training_data: Vec<(f64, f64)> = (0..n)
+        let mut training_data: Vec<(f64, f64)> = (0..n)
             .map(|i| {
                 let x = -PI + 2.0 * PI * (i as f64) / (n as f64 - 1.0);
                 // The input is normalized in [-1, 1] but the target is the true sin(x)
@@ -155,11 +167,17 @@ mod tests {
             .collect();
 
         // Repeatedly train over the training data set until loss improves.
-        let epochs = 20_000;
+        let mut rng = rand::rng();
+        let epochs = 10_000;
         for epoch in 0..epochs {
+            // We shuffle the data set and process it in 4 batches of 16 inputs each.
+            training_data.shuffle(&mut rng);
+            let (inputs, outputs): (Vec<f64>, Vec<f64>) = training_data.clone().into_iter().unzip();
             // One pass over the dataset, one example at a time (stochastic gradient descent).
             let mut total_loss = 0.0;
-            for &(x, y) in &training_data {
+            for i in 0..4 {
+                let x = Tensor::from_vec(Vec::from(&inputs[i * 16..(i + 1) * 16]), 16, 1);
+                let y = Tensor::from_vec(Vec::from(&outputs[i * 16..(i + 1) * 16]), 16, 1);
                 total_loss += net.train_step(x, y, learning_rate);
             }
             if epoch % 1000 == 0 {
@@ -178,7 +196,7 @@ mod tests {
         let mut prediction_loss = 0.0;
         for _ in 0..n {
             let x = distribution.sample(&mut rng);
-            let y = net.predict(x);
+            let y = net.predict(Tensor::from_vec(vec![x], 1, 1)).data[0];
             let expected = (x * PI).sin();
             let err = (y - expected).powi(2);
             println!(
