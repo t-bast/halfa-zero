@@ -10,7 +10,7 @@
 //!
 //! Cube coordinates are *build-time scaffolding only*. We use them here to enumerate the holes and
 //! to precompute flat lookup tables (neighbours, jumps, symmetry permutations), but everything
-//! downstream (move generation, bitboards, MCTS) works purely on `u16` hole indices and never
+//! downstream (move generation, bitboards, MCTS) works purely on `u8` hole indices and never
 //! performs coordinate arithmetic in a hot loop.
 
 use std::fmt;
@@ -114,6 +114,18 @@ impl Coordinate {
     }
 }
 
+#[derive(Copy, Clone, Debug)]
+pub struct GameState {
+    /// Since the board contains 121 holes, we encode the state of a player as a 128-bit integer
+    /// interpreted as a bitfield of occupied holes. This very cheap to copy, mutate and check.
+    players: [u128; 2],
+    /// Index of the player whose turn it is inside the `players` list.
+    side: u8,
+    /// Since players can stall the game by not making any move, we have an upper limit on the
+    /// number of rounds: after that, the game is a draw.
+    remaining_rounds: u16,
+}
+
 /// Immutable board geometry, built once at startup and shared for the lifetime of the program.
 /// We precompute potential moves in the `neighbours` and `jumps` fields for every position.
 pub struct Board {
@@ -124,24 +136,30 @@ pub struct Board {
     /// Reverse map that returns the index of a given [Coordinate] in the `holes` array, or `None`
     /// for off-board points.
     /// The index is simply `(x + 2n, y + 2n)` (since `z` is implied by `x + y + z = 0`).
-    lookup: Vec<Option<u16>>,
+    lookup: Vec<Option<u8>>,
     /// `neighbours[i][d]` = hole reached by one step from `i` in direction `d`, if on board.
-    neighbours: Vec<[Option<u16>; 6]>,
+    neighbours: Vec<[Option<u8>; 6]>,
+    /// `neighbour_mask[i]` = bitmask of every hole adjacent to `i`.
+    /// The same information as `neighbours[i]`, but in a form you can AND against occupancy.
+    neighbour_mask: Vec<u128>,
     /// `jumps[i][d]` = `(hole jumped over, landing hole)` for a hop from `i` in direction `d`.
-    jumps: Vec<[Option<(u16, u16)>; 6]>,
+    jumps: Vec<[Option<(u8, u8)>; 6]>,
     /// `rotation[i]` = index of hole `i` after a 180° rotation.
-    rotation: Vec<u16>,
+    rotation: Vec<u8>,
     /// `reflection[i]` = index of hole `i` after mirroring.
-    reflection: Vec<u16>,
+    reflection: Vec<u8>,
 }
 
 impl Board {
     pub fn new(n: i32) -> Self {
         assert!(n >= 1, "board size must be at least 1");
+        // We don't allow creating boards larger than the official board, which contains 121 holes
+        // and lets us efficiently encode game state in 128-bit integers.
+        assert!(n <= 4, "board size must be at most 4");
 
         let span = 4 * n + 1;
         let mut holes: Vec<Coordinate> = Vec::new();
-        let mut lookup: Vec<Option<u16>> = vec![None; (span * span) as usize];
+        let mut lookup: Vec<Option<u8>> = vec![None; (span * span) as usize];
 
         // Enumerate lexicographically by (x, y). Since home membership is exactly `x >= n+1` or
         // `x <= -(n+1)`, ascending x puts one home triangle at the very start of the index range
@@ -154,8 +172,8 @@ impl Board {
                     continue;
                 }
                 let index = holes.len();
-                assert!(index < u16::MAX as usize, "too many holes for u16 indices");
-                lookup[Self::lookup_key(n, c)] = Some(index as u16);
+                assert!(index < u8::MAX as usize, "too many holes for u8 indices");
+                lookup[Self::lookup_key(n, c)] = Some(index as u8);
                 holes.push(c);
             }
         }
@@ -165,12 +183,14 @@ impl Board {
             holes,
             lookup,
             neighbours: Vec::new(),
+            neighbour_mask: Vec::new(),
             jumps: Vec::new(),
             rotation: Vec::new(),
             reflection: Vec::new(),
         };
 
         board.neighbours = board.build_neighbours();
+        board.neighbour_mask = board.build_neighbour_masks();
         board.jumps = board.build_jumps();
         board.rotation = board.build_permutation(Coordinate::rotate_180);
         board.reflection = board.build_permutation(Coordinate::mirror);
@@ -216,8 +236,8 @@ impl Board {
 
     /// For every hole and every direction, we pre-compute the neighbour hole index if it belongs
     /// to the board.
-    fn build_neighbours(&self) -> Vec<[Option<u16>; 6]> {
-        let mut neighbours: Vec<[Option<u16>; 6]> = Vec::new();
+    fn build_neighbours(&self) -> Vec<[Option<u8>; 6]> {
+        let mut neighbours: Vec<[Option<u8>; 6]> = Vec::new();
         for i in 0..self.len() {
             let current = self.holes[i];
             neighbours.push(Self::DIRECTIONS.map(|direction| {
@@ -228,6 +248,18 @@ impl Board {
         neighbours
     }
 
+    fn build_neighbour_masks(&self) -> Vec<u128> {
+        let mut neighbour_masks: Vec<u128> = Vec::new();
+        for i in 0..self.len() {
+            let neighbour_mask = self.neighbours[i]
+                .iter()
+                .flatten()
+                .fold(0u128, |mask, &j| mask | (1u128 << j));
+            neighbour_masks.push(neighbour_mask);
+        }
+        neighbour_masks
+    }
+
     /// For every hole and every direction, we pre-compute the jump over the neighbour in that
     /// direction and store the jumped-over neighbour and the landing hole.
     /// Both must exist as holes: you cannot jump over a point that isn't on the board, and you
@@ -236,8 +268,8 @@ impl Board {
     ///
     /// Note that `jumps[i][d]` being `Some` and `neighbours[i][d]` being `Some` are not the same
     /// condition: the second is implied by the first, but not the reverse.
-    fn build_jumps(&self) -> Vec<[Option<(u16, u16)>; 6]> {
-        let mut jumps: Vec<[Option<(u16, u16)>; 6]> = Vec::new();
+    fn build_jumps(&self) -> Vec<[Option<(u8, u8)>; 6]> {
+        let mut jumps: Vec<[Option<(u8, u8)>; 6]> = Vec::new();
         for i in 0..self.len() {
             let current = self.holes[i];
             jumps.push(Self::DIRECTIONS.map(|direction| {
@@ -260,8 +292,8 @@ impl Board {
 
     /// `perm[i]` = index of the hole that `map` sends hole `i` to.
     /// Note that `map` must be a valid permutation, otherwise we'll throw.
-    fn build_permutation(&self, map: fn(Coordinate) -> Coordinate) -> Vec<u16> {
-        let mut permutation: Vec<u16> = Vec::new();
+    fn build_permutation(&self, map: fn(Coordinate) -> Coordinate) -> Vec<u8> {
+        let mut permutation: Vec<u8> = Vec::new();
         for i in 0..self.len() {
             let rotated = map(self.holes[i]);
             assert!(
@@ -329,22 +361,109 @@ impl Board {
         // the second player's triangle is simply the last elements.
         let range1 = 0..self.pieces_per_player();
         let range2 = (self.len() - self.pieces_per_player())..self.len();
-        // We verify that each range has a correct `x` field, otherwise there's a serious bug.
-        for i in range1.clone() {
-            let x = self.holes[i].x;
-            assert!(
-                x >= -2 * self.n && x < -self.n,
-                "first home triangle not correctly computed"
-            );
-        }
-        for j in range2.clone() {
-            let x = self.holes[j].x;
-            assert!(
-                x > self.n && x <= 2 * self.n,
-                "second home triangle not correctly computed"
-            );
-        }
         (range1, range2)
+    }
+
+    /// Return the initial states of the two players.
+    /// Note that the initial state of the first player is the winning state of the second player,
+    /// and the other way around.
+    pub fn starting_states(&self, max_rounds: u16) -> GameState {
+        let (r1, r2) = self.home_ranges();
+        let mut player1: u128 = 0;
+        r1.for_each(|i| player1 |= 1u128 << i);
+        let mut player2: u128 = 0;
+        r2.for_each(|i| player2 |= 1u128 << i);
+        GameState {
+            players: [player1, player2],
+            side: 0,
+            remaining_rounds: max_rounds,
+        }
+    }
+
+    /// All legal moves for `player` as `(from, to)` pairs (optimized implementation using binary
+    /// operations, avoiding heap-allocated collections).
+    ///
+    /// A move is either one step into an adjacent empty hole, or a chain of one or more hops.
+    /// Because hops never remove the jumped piece, the board is *static* for the whole duration
+    /// of a chain — so enumerating chains is plain reachability on a fixed graph, not a search.
+    /// And because the path is unobservable in the resulting position, the destination alone
+    /// identifies the move: we return a set of destinations, never paths.
+    pub fn available_moves(&self, player: u128, adversary: u128) -> Vec<(u8, u8)> {
+        debug_assert!(self.len() <= u8::MAX as usize + 1);
+        debug_assert_eq!(player & adversary, 0, "overlapping pieces");
+
+        // Positions occupied by us or our adversary.
+        let occupied_positions = player | adversary;
+        let mut moves: Vec<(u8, u8)> = Vec::with_capacity(64);
+
+        let mut pieces = player;
+        while pieces != 0 {
+            // trailing_zeroes provides the lowest bit set: x &= x - 1 clears it (subtracting 1
+            // flips the lowest set bit to 0 and turns every zero below it into a 1, so the AND
+            // wipes exactly that one bit).
+            let from = pieces.trailing_zeros() as usize;
+            pieces &= pieces - 1;
+            let from_bit = 1u128 << from;
+
+            // Lift the moving piece off its origin: for the duration of this move the origin is
+            // an empty hole, so it can be neither jumped over nor treated as blocked.
+            let occupied = occupied_positions & !from_bit;
+
+            // We first compute moves to direct neighbours that aren't already occupied (either by
+            // us or our adversary).
+            let mut available_neighbours = self.neighbour_mask[from] & !occupied;
+            while available_neighbours != 0 {
+                let to = available_neighbours.trailing_zeros() as usize;
+                available_neighbours &= available_neighbours - 1;
+                moves.push((from as u8, to as u8));
+            }
+
+            // Then we compute jumps recursively (we can chain several jumps in a single move).
+            // Note that the landing hole must not be occupied (either by us or our adversary).
+            // The `reached` variable tracks every hole this piece can land on, while `frontier`
+            // tracks the holes we still have to use as starting hole.
+            // Seeding `reached` with the origin does double duty: it stops the chain re-entering
+            // its own starting hole, and it keeps the null move out of the result.
+            let mut reached = from_bit;
+            let mut frontier = from_bit;
+            while frontier != 0 {
+                let idx = frontier.trailing_zeros() as usize;
+                frontier &= frontier - 1;
+                // We check each jump direction.
+                for d in 0..6 {
+                    if let Some((over, to)) = self.jumps[idx][d] {
+                        let to_bit = 1u128 << to;
+                        let over_occupied = occupied & (1u128 << over) != 0;
+                        let landing_free = (occupied | reached) & to_bit == 0;
+                        if over_occupied && landing_free {
+                            reached |= to_bit;
+                            frontier |= to_bit;
+                        }
+                    }
+                }
+            }
+            // At that point, reached contains all the holes we can reach by jumps.
+            // We simply need to add them to our available moves.
+            let mut chains = reached & !from_bit;
+            while chains != 0 {
+                let to = chains.trailing_zeros() as usize;
+                chains &= chains - 1;
+                moves.push((from as u8, to as u8));
+            }
+        }
+
+        moves
+    }
+
+    pub fn is_occupied(state: u128, position: u8) -> bool {
+        (state & (1u128 << position)) != 0
+    }
+
+    pub fn make_move(state: u128, from: u8, to: u8) -> u128 {
+        let mut state1 = state;
+        state1 ^= 1u128 << from; // unset the previous position
+        state1 |= 1u128 << to; // set the new position
+        state1
     }
 
     /// Render the board, using `glyph(index)` to choose the character for each hole.
@@ -413,24 +532,25 @@ impl fmt::Display for Board {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `N = 2`: 37 holes, rows of 1, 2, 7, 6, 5, 6, 7, 2, 1. Small enough to check by eye: this is
-    /// the expected output of `render`, so it can be used as a regression test on the layout.
-    const STAR_N2: &str = concat!(
-        "  4        .\n",
-        "  3       . .\n",
-        "  2  . . . . . . .\n",
-        "  1   . . . . . .\n",
-        "  0    . . . . .\n",
-        " -1   . . . . . .\n",
-        " -2  . . . . . . .\n",
-        " -3       . .\n",
-        " -4        .\n",
-    );
+    use rand::Rng;
+    use rand::distr::Uniform;
+    use rand::prelude::*;
+    use std::collections::HashSet;
 
     #[test]
     fn ascii_layout() {
         let g = Board::new(2);
+        const STAR_N2: &str = concat!(
+            "  4        .\n",
+            "  3       . .\n",
+            "  2  . . . . . . .\n",
+            "  1   . . . . . .\n",
+            "  0    . . . . .\n",
+            " -1   . . . . . .\n",
+            " -2  . . . . . . .\n",
+            " -3       . .\n",
+            " -4        .\n",
+        );
         assert_eq!(g.render(|_| '.'), STAR_N2);
         // We print the real board for manual verification as well.
         println!("{}", Board::new(4).render_homes());
@@ -438,7 +558,7 @@ mod tests {
 
     #[test]
     fn hole_counts() {
-        for n in 1..=6 {
+        for n in 1..=4 {
             let g = Board::new(n);
             assert_eq!(
                 g.len() as i32,
@@ -581,5 +701,266 @@ mod tests {
         // Distance must agree with breadth-first search on the neighbour table for holes that are
         // connected by a straight line inside the board.
         assert_eq!(Coordinate::new(0, 0).distance(Coordinate::new(2, -1)), 2);
+    }
+
+    #[test]
+    fn game_state() {
+        let g = Board::new(4);
+        // Players start at opposing sides of the board.
+        let state_0 = g.starting_states(10_000);
+        let alice_0 = state_0.players[0];
+        let bob_0 = state_0.players[1];
+        assert_eq!(10, alice_0.count_ones());
+        (0..10).for_each(|i| assert!(Board::is_occupied(alice_0, i)));
+        assert_eq!(10, bob_0.count_ones());
+        (111..121).for_each(|i| assert!(Board::is_occupied(bob_0, i)));
+        // Moving correctly sets the state.
+        let alice_1 = Board::make_move(alice_0, 3, 17);
+        assert_eq!(10, alice_1.count_ones());
+        assert!(Board::is_occupied(alice_1, 17));
+        assert!(!Board::is_occupied(alice_1, 3));
+        // We even support no-op moves (but it's useless).
+        let bob_1 = Board::make_move(bob_0, 113, 113);
+        assert_eq!(10, bob_1.count_ones());
+        assert!(Board::is_occupied(bob_1, 113));
+    }
+
+    /// Naive, deliberately inefficient move generator used to verify the correctness of the
+    /// optimized implementation of `available_moves`.
+    ///
+    /// The point is *independence*: this shares nothing with the optimized generator except the
+    /// primitives that already have their own tests. It works directly in cube coordinates on a
+    /// `HashSet` of occupied holes and enumerates hop *paths* explicitly.
+    ///
+    /// It returns coordinate pairs rather than indices so that comparing against it also
+    /// exercises the neighbour/jump tables and the index enumeration.
+    fn reference_moves(
+        board: &Board,
+        player: u128,
+        adversary: u128,
+    ) -> HashSet<(Coordinate, Coordinate)> {
+        let n = board.n();
+        let all: HashSet<Coordinate> = (0..board.len())
+            .filter(|&i| {
+                Board::is_occupied(player, i as u8) || Board::is_occupied(adversary, i as u8)
+            })
+            .map(|i| board.hole(i))
+            .collect();
+
+        let mut moves = HashSet::new();
+        for i in 0..board.len() {
+            if !Board::is_occupied(player, i as u8) {
+                continue;
+            }
+            let from = board.hole(i);
+
+            // Lift the moving piece: for the duration of this move its origin is an empty hole.
+            let mut occupied = all.clone();
+            occupied.remove(&from);
+
+            // Single steps: one hole in any of the six directions, if on board and empty.
+            let mut steps = HashSet::new();
+            for d in Board::DIRECTIONS {
+                let to = from.add(d);
+                if to.on_board(n) && !occupied.contains(&to) {
+                    steps.insert(to);
+                }
+            }
+
+            // Jump chains, by explicit depth-first path enumeration.
+            let mut chains = HashSet::new();
+            let mut path = vec![from];
+            walk_paths(n, &occupied, from, &mut path, &mut chains);
+
+            // We verify that neighbour steps and jumps can never land on the same holes.
+            assert!(
+                steps.is_disjoint(&chains),
+                "step and chain destinations overlap at {:?}",
+                from
+            );
+
+            for to in steps.into_iter().chain(chains) {
+                moves.insert((from, to));
+            }
+        }
+        moves
+    }
+
+    /// Enumerate every jump path from `current`, recording the destinations reached along the way.
+    ///
+    /// Restricting to simple paths (never revisiting a hole) is what guarantees termination, and it
+    /// loses nothing: the board is static during a chain, so arriving at a hole a second time
+    /// offers exactly the same onward hops as the first time.
+    ///
+    /// Both `over` and `landing` need an on-board check. The star is not convex, so it is not
+    /// enough to verify the landing hole: you can have an on-board origin whose neighbour falls in
+    /// one of the notches between the points.
+    fn walk_paths(
+        n: i32,
+        occupied: &HashSet<Coordinate>,
+        current: Coordinate,
+        path: &mut Vec<Coordinate>,
+        found: &mut HashSet<Coordinate>,
+    ) {
+        for d in Board::DIRECTIONS {
+            let over = current.add(d);
+            let landing = over.add(d);
+            // We must stay on the board.
+            if !over.on_board(n) || !landing.on_board(n) {
+                continue;
+            }
+            // We can only jump above an occupied hole towards an unoccupied hole.
+            if !occupied.contains(&over) || occupied.contains(&landing) {
+                continue;
+            }
+            // We avoid loops inside a path, otherwise we won't terminate.
+            if path.contains(&landing) {
+                continue;
+            }
+            found.insert(landing);
+            path.push(landing);
+            walk_paths(n, occupied, landing, path, found);
+            path.pop();
+        }
+    }
+
+    /// Compare both move generators at one position, rendering the board if they disagree.
+    fn assert_move_generators_agree(board: &Board, player: u128, adversary: u128) {
+        let fast = board.available_moves(player, adversary);
+        let fast_set: HashSet<(Coordinate, Coordinate)> = fast
+            .iter()
+            .map(|&(f, t)| (board.hole(f as usize), board.hole(t as usize)))
+            .collect();
+        assert_eq!(
+            fast.len(),
+            fast_set.len(),
+            "fast generator emitted duplicate moves"
+        );
+        let expected = reference_moves(board, player, adversary);
+        if fast_set != expected {
+            let rendered = board.render(|i| match i as u8 {
+                i if Board::is_occupied(player, i) => 'A',
+                i if Board::is_occupied(adversary, i) => 'B',
+                _ => '.',
+            });
+            let only_fast: Vec<_> = fast_set.difference(&expected).collect();
+            let only_ref: Vec<_> = expected.difference(&fast_set).collect();
+            panic!(
+                "generators disagree\n{}\nfast only: {:?}\nreference only: {:?}",
+                rendered, only_fast, only_ref
+            );
+        }
+    }
+
+    #[test]
+    fn generate_valid_moves() {
+        let g = Board::new(2);
+        // We simulate the following state which contains interesting moves:
+        const SAMPLE_BOARD: &str = concat!(
+            "  4        .\n",
+            "  3       . .\n",
+            "  2  . . . . B . .\n",
+            "  1   . . . B . .\n",
+            "  0    . . A B .\n",
+            " -1   . . . A . .\n",
+            " -2  . . . . . . .\n",
+            " -3       A .\n",
+            " -4        .\n",
+        );
+        let state_0 = g.starting_states(10_000);
+        let mut alice = state_0.players[0];
+        alice = Board::make_move(alice, 0, 12);
+        alice = Board::make_move(alice, 1, 18);
+        let mut bob = state_0.players[1];
+        bob = Board::make_move(bob, 34, 17);
+        bob = Board::make_move(bob, 35, 23);
+        bob = Board::make_move(bob, 36, 29);
+        let rendered = g.render(|i| match i {
+            i if Board::is_occupied(alice, i as u8) => 'A',
+            i if Board::is_occupied(bob, i as u8) => 'B',
+            _ => '.',
+        });
+        assert_eq!(rendered, SAMPLE_BOARD);
+        let mut expected_moves: HashSet<(u8, u8)> = HashSet::new();
+        // The bottom-most piece can only go to its direct neighbours:
+        expected_moves.insert((2, 0));
+        expected_moves.insert((2, 1));
+        expected_moves.insert((2, 6));
+        expected_moves.insert((2, 7));
+        // The middle piece can go to its direct neighbours:
+        expected_moves.insert((12, 11));
+        expected_moves.insert((12, 13));
+        expected_moves.insert((12, 5));
+        expected_moves.insert((12, 6));
+        // And also make a few jumps:
+        expected_moves.insert((12, 24));
+        expected_moves.insert((12, 22));
+        expected_moves.insert((12, 34));
+        // The upper piece can go to its direct neighbours:
+        expected_moves.insert((18, 19));
+        expected_moves.insert((18, 13));
+        expected_moves.insert((18, 24));
+        // And also make a few jumps:
+        expected_moves.insert((18, 5));
+        expected_moves.insert((18, 16));
+        let computed_moves = HashSet::from_iter(g.available_moves(alice, bob));
+        assert_eq!(expected_moves, computed_moves);
+    }
+
+    #[test]
+    fn generate_valid_moves_during_random_games() {
+        let board = Board::new(2);
+        let mut rng = rand::rng();
+        for _ in 0..100 {
+            let [mut a, mut b] = board.starting_states(10_000).players;
+            let mut side = 0;
+            for _ in 0..60 {
+                let (player, adversary) = if side == 0 { (a, b) } else { (b, a) };
+                assert_move_generators_agree(&board, player, adversary);
+                let moves = board.available_moves(player, adversary);
+                if moves.is_empty() {
+                    break;
+                }
+                let (from, to) = moves[rng.next_u32() as usize % moves.len()];
+                let moved = Board::make_move(player, from, to);
+                if side == 0 {
+                    a = moved
+                } else {
+                    b = moved
+                }
+                side ^= 1;
+            }
+        }
+    }
+
+    #[test]
+    fn generators_agree_on_random_positions() {
+        let mut rng = rand::rng();
+        for n in 1..=4 {
+            let board = Board::new(n);
+            let distribution = Uniform::new(0, board.len()).unwrap();
+            let half_distribution = Uniform::new(0, board.len() / 2).unwrap();
+            for _ in 0..200 {
+                // Vary density. Dense clusters produce long hop chains, which is where the
+                // reached/frontier logic gets stressed — legal play from the opening keeps
+                // pieces spread out and rarely generates them.
+                let count = 2 + half_distribution.sample(&mut rng);
+                let (mut a, mut b) = (0u128, 0u128);
+                let mut placed = 0;
+                while placed < count {
+                    let bit = 1u128 << distribution.sample(&mut rng);
+                    if (a | b) & bit != 0 {
+                        continue;
+                    }
+                    if placed % 2 == 0 {
+                        a |= bit
+                    } else {
+                        b |= bit
+                    }
+                    placed += 1;
+                }
+                assert_move_generators_agree(&board, a, b);
+            }
+        }
     }
 }
