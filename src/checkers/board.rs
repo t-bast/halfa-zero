@@ -114,16 +114,19 @@ impl Coordinate {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+/// The game state is very small: it can be used in a hash map to detect duplicates, which is very
+/// important during the learning phase since we don't care about the history of the moves when
+/// deciding the next move, we only care about the board state.
+///
+/// We thus keep this struct minimal: don't add any field that would mess up duplicate states
+/// detection.
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
 pub struct GameState {
     /// Since the board contains 121 holes, we encode the state of a player as a 128-bit integer
     /// interpreted as a bitfield of occupied holes. This very cheap to copy, mutate and check.
     players: [u128; 2],
     /// Index of the player whose turn it is inside the `players` list.
     side: u8,
-    /// Since players can stall the game by not making any move, we have an upper limit on the
-    /// number of rounds: after that, the game is a draw.
-    remaining_rounds: u16,
 }
 
 /// Immutable board geometry, built once at startup and shared for the lifetime of the program.
@@ -367,7 +370,7 @@ impl Board {
     /// Return the initial states of the two players.
     /// Note that the initial state of the first player is the winning state of the second player,
     /// and the other way around.
-    pub fn starting_states(&self, max_rounds: u16) -> GameState {
+    pub fn starting_states(&self) -> GameState {
         let (r1, r2) = self.home_ranges();
         let mut player1: u128 = 0;
         r1.for_each(|i| player1 |= 1u128 << i);
@@ -376,7 +379,6 @@ impl Board {
         GameState {
             players: [player1, player2],
             side: 0,
-            remaining_rounds: max_rounds,
         }
     }
 
@@ -707,7 +709,7 @@ mod tests {
     fn game_state() {
         let g = Board::new(4);
         // Players start at opposing sides of the board.
-        let state_0 = g.starting_states(10_000);
+        let state_0 = g.starting_states();
         let alice_0 = state_0.players[0];
         let bob_0 = state_0.players[1];
         assert_eq!(10, alice_0.count_ones());
@@ -867,7 +869,7 @@ mod tests {
             " -3       A .\n",
             " -4        .\n",
         );
-        let state_0 = g.starting_states(10_000);
+        let state_0 = g.starting_states();
         let mut alice = state_0.players[0];
         alice = Board::make_move(alice, 0, 12);
         alice = Board::make_move(alice, 1, 18);
@@ -912,7 +914,7 @@ mod tests {
         let board = Board::new(2);
         let mut rng = rand::rng();
         for _ in 0..100 {
-            let [mut a, mut b] = board.starting_states(10_000).players;
+            let [mut a, mut b] = board.starting_states().players;
             let mut side = 0;
             for _ in 0..60 {
                 let (player, adversary) = if side == 0 { (a, b) } else { (b, a) };
@@ -962,5 +964,53 @@ mod tests {
                 assert_move_generators_agree(&board, a, b);
             }
         }
+    }
+
+    // This test is just a sample to showcase how a random game is played and how win detection
+    // works, with a cap on the number of rounds.
+    #[test]
+    fn play_random_game() {
+        let mut rng = rand::rng();
+        let board = Board::new(2);
+        let mut state = board.starting_states();
+        // Each player wins by occupying the other player's starting triangle.
+        let winning_a = state.players[1];
+        let winning_b = state.players[0];
+        // Since players can stall the game by not making any move, we have an upper limit on the
+        // number of rounds: after that, the game is a draw.
+        let mut remaining_rounds: u16 = 10_000;
+        while remaining_rounds > 0 {
+            let player = state.players[state.side as usize];
+            let adversary = state.players[(state.side ^ 1) as usize];
+            let moves = board.available_moves(player, adversary);
+            let distribution = Uniform::new(0, moves.len()).unwrap();
+            let (from, to) = moves[distribution.sample(&mut rng)];
+            let player_after_move = Board::make_move(player, from, to);
+            state.players[state.side as usize] = player_after_move;
+            match state.side {
+                0 if player_after_move == winning_a => {
+                    println!("Player A wins!");
+                    break;
+                }
+                1 if player_after_move == winning_b => {
+                    println!("Player B wins!");
+                    break;
+                }
+                _ => (),
+            }
+            state.side ^= 1;
+            remaining_rounds -= 1;
+        }
+        if remaining_rounds == 0 {
+            println!("The game is a DRAW!");
+        }
+        println!(
+            "{}",
+            board.render(|i| match i {
+                i if Board::is_occupied(state.players[0], i as u8) => 'A',
+                i if Board::is_occupied(state.players[1], i as u8) => 'B',
+                _ => '.',
+            })
+        );
     }
 }
