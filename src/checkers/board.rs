@@ -129,6 +129,76 @@ pub struct GameState {
     side: u8,
 }
 
+impl GameState {
+    pub fn side(&self) -> u8 {
+        self.side
+    }
+
+    /// Pieces of the player about to move.
+    pub fn mover(&self) -> u128 {
+        match self.side {
+            0 => self.players[0],
+            _ => self.players[1],
+        }
+    }
+
+    /// Pieces of the player who just moved.
+    pub fn adversary(&self) -> u128 {
+        match self.side {
+            0 => self.players[1],
+            _ => self.players[0],
+        }
+    }
+
+    pub fn player(&self, p: u8) -> u128 {
+        self.players[p as usize]
+    }
+
+    /// Apply a legal move for the side to move and hand the turn to the next player.
+    pub fn apply(&self, from: u8, to: u8) -> GameState {
+        let mut moving = self.mover();
+        debug_assert!(Board::is_occupied(moving, from), "no piece at origin");
+        debug_assert!(
+            !Board::is_occupied(self.players[0] | self.players[1], to),
+            "destination occupied"
+        );
+        moving ^= 1u128 << from; // unset the previous position
+        moving |= 1u128 << to; // set the new position
+        GameState {
+            players: match self.side {
+                0 => [moving, self.players[1]],
+                _ => [self.players[0], moving],
+            },
+            side: self.side ^ 1,
+        }
+    }
+}
+
+/// How a finished game ended. `Win` and `CapWin` produce the same training target, but keeping them
+/// distinct matters for diagnostics: the fraction of games decided by a real win/loss (instead of
+/// an unofficial "win" after reaching the maximum number of rounds) is the clearest signal of
+/// whether self-play is actually learning to finish.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// This player filled their target triangle (official win).
+    Win(u8),
+    /// We've reached the maximum number of rounds without an official winner.
+    /// We compute which player was strictly closer to winning.
+    CapWin(u8),
+    /// The maximum number of rounds was reached with both players equally far from winning.
+    Draw,
+}
+
+impl Outcome {
+    pub fn winner(&self) -> Option<u8> {
+        match self {
+            Outcome::Win(player) => Some(*player),
+            Outcome::CapWin(player) => Some(*player),
+            Outcome::Draw => None,
+        }
+    }
+}
+
 /// Immutable board geometry, built once at startup and shared for the lifetime of the program.
 /// We precompute potential moves in the `neighbours` and `jumps` fields for every position.
 pub struct Board {
@@ -151,6 +221,12 @@ pub struct Board {
     rotation: Vec<u8>,
     /// `reflection[i]` = index of hole `i` after mirroring.
     reflection: Vec<u8>,
+    /// We precompute the target triangle that each player must fill to win.
+    /// This is the *opposite* home to where they start.
+    target_mask: [u128; 2],
+    /// For each player, we precompute a static table with the distance from each hole in the board
+    /// to the nearest hole of the player's target triangle (or 0 for holes already in the target).
+    distance_to_target: [Vec<u8>; 2],
 }
 
 impl Board {
@@ -187,6 +263,8 @@ impl Board {
             lookup,
             neighbours: Vec::new(),
             neighbour_mask: Vec::new(),
+            target_mask: [0u128, 0u128],
+            distance_to_target: [Vec::new(), Vec::new()],
             jumps: Vec::new(),
             rotation: Vec::new(),
             reflection: Vec::new(),
@@ -194,6 +272,8 @@ impl Board {
 
         board.neighbours = board.build_neighbours();
         board.neighbour_mask = board.build_neighbour_masks();
+        board.target_mask = board.build_target_masks();
+        board.distance_to_target = board.build_distance_tables();
         board.jumps = board.build_jumps();
         board.rotation = board.build_permutation(Coordinate::rotate_180);
         board.reflection = board.build_permutation(Coordinate::mirror);
@@ -261,6 +341,32 @@ impl Board {
             neighbour_masks.push(neighbour_mask);
         }
         neighbour_masks
+    }
+
+    fn build_target_masks(&self) -> [u128; 2] {
+        let (bottom, top) = self.home_ranges();
+        let mask = |r: Range<usize>| r.fold(0u128, |mask, i| mask | (1u128 << i));
+        [mask(top), mask(bottom)]
+    }
+
+    fn build_distance_tables(&self) -> [Vec<u8>; 2] {
+        let (bottom, top) = self.home_ranges();
+        let table = |target: Range<usize>| -> Vec<u8> {
+            (0..self.len())
+                .map(|i| {
+                    if target.contains(&i) {
+                        0u8
+                    } else {
+                        target
+                            .clone()
+                            .map(|j| self.holes[i].distance(self.holes[j]) as u8)
+                            .min()
+                            .unwrap()
+                    }
+                })
+                .collect()
+        };
+        [table(top), table(bottom)]
     }
 
     /// For every hole and every direction, we pre-compute the jump over the neighbour in that
@@ -370,7 +476,7 @@ impl Board {
     /// Return the initial states of the two players.
     /// Note that the initial state of the first player is the winning state of the second player,
     /// and the other way around.
-    pub fn starting_states(&self) -> GameState {
+    pub fn starting_state(&self) -> GameState {
         let (r1, r2) = self.home_ranges();
         let mut player1: u128 = 0;
         r1.for_each(|i| player1 |= 1u128 << i);
@@ -380,6 +486,24 @@ impl Board {
             players: [player1, player2],
             side: 0,
         }
+    }
+
+    /// Returns the target winning state for the given player.
+    pub fn winning_state(&self, player: u8) -> u128 {
+        self.target_mask[player as usize]
+    }
+
+    /// We compute a lower-bound on the distance of a player to its winning state.
+    /// Note that this is just an estimate, which depends on game conditions.
+    pub fn remaining_distance(&self, state: &GameState, player: u8) -> u32 {
+        let mut player_state = state.player(player);
+        let mut total_distance = 0u32;
+        while player_state != 0 {
+            let from = player_state.trailing_zeros() as u8;
+            player_state &= player_state - 1;
+            total_distance += self.distance_to_target[player as usize][from as usize] as u32;
+        }
+        total_distance
     }
 
     /// All legal moves for `player` as `(from, to)` pairs (optimized implementation using binary
@@ -457,15 +581,46 @@ impl Board {
         moves
     }
 
-    pub fn is_occupied(state: u128, position: u8) -> bool {
-        (state & (1u128 << position)) != 0
+    /// The result of the game, or `None` if it is still running.
+    /// This should be checked after every move.
+    pub fn outcome(&self, state: &GameState, remaining_moves: u16) -> Option<Outcome> {
+        // Only the player who just moved can have completed their triangle.
+        let just_moved = state.side ^ 1;
+        debug_assert!(
+            state.mover() != self.winning_state(state.side),
+            "side to move has already won; an outcome() check was missed"
+        );
+        match remaining_moves {
+            // If the player who just moved has completed their triangle, they win.
+            _ if state.adversary() == self.winning_state(just_moved) => {
+                Some(Outcome::Win(just_moved))
+            }
+            // If we've exhausted all rounds without a winner, we let the player that is closer to
+            // its winning state win (if any).
+            0 => match [0u8, 1u8].map(|i| self.remaining_distance(state, i)) {
+                [dist0, dist1] if dist0 < dist1 => Some(Outcome::CapWin(0)),
+                [dist0, dist1] if dist0 > dist1 => Some(Outcome::CapWin(1)),
+                _ => Some(Outcome::Draw),
+            },
+            _ => None, // the game is still running
+        }
     }
 
-    pub fn make_move(state: u128, from: u8, to: u8) -> u128 {
-        let mut state1 = state;
-        state1 ^= 1u128 << from; // unset the previous position
-        state1 |= 1u128 << to; // set the new position
-        state1
+    /// The score associated with a game's outcome from the perspective of the side to move:
+    /// `+1` win, `-1` loss, `0` draw. `None` if the game is still running.
+    pub fn outcome_score(&self, state: &GameState, remaining_moves: u16) -> Option<f32> {
+        self.outcome(state, remaining_moves)
+            .map(|outcome| match outcome {
+                Outcome::Win(winner) if winner == state.side => 1.0,
+                Outcome::Win(_) => -1.0,
+                Outcome::CapWin(winner) if winner == state.side => 1.0,
+                Outcome::CapWin(_) => -1.0,
+                Outcome::Draw => 0.0,
+            })
+    }
+
+    pub fn is_occupied(state: u128, position: u8) -> bool {
+        (state & (1u128 << position)) != 0
     }
 
     /// Render the board, using `glyph(index)` to choose the character for each hole.
@@ -675,7 +830,6 @@ mod tests {
         assert_eq!(top.len(), g.pieces_per_player());
         assert_eq!(bottom.start, 0);
         assert_eq!(top.end, g.len());
-
         for i in bottom.clone() {
             assert!(g.hole(i).x <= -(g.n() + 1));
             assert!(top.contains(&g.rotate(i)));
@@ -706,10 +860,31 @@ mod tests {
     }
 
     #[test]
+    fn distance_tables_agree_with_rotation() {
+        // The two targets are related by the 180° rotation, so the two distance tables must
+        // be too. If this fails, one player is being scored on a different scale from the
+        // other and every capped game is decided unfairly.
+        for n in 1..=4 {
+            let board = Board::new(n);
+            for i in 0..board.len() {
+                assert_eq!(
+                    board.distance_to_target[1][i],
+                    board.distance_to_target[0][board.rotate(i)]
+                );
+            }
+            // Distance is zero exactly on the target holes, and nowhere else.
+            for i in 0..board.len() {
+                let in_target = Board::is_occupied(board.winning_state(0), i as u8);
+                assert_eq!(board.distance_to_target[0][i] == 0, in_target);
+            }
+        }
+    }
+
+    #[test]
     fn game_state() {
         let g = Board::new(4);
         // Players start at opposing sides of the board.
-        let state_0 = g.starting_states();
+        let state_0 = g.starting_state();
         let alice_0 = state_0.players[0];
         let bob_0 = state_0.players[1];
         assert_eq!(10, alice_0.count_ones());
@@ -717,14 +892,133 @@ mod tests {
         assert_eq!(10, bob_0.count_ones());
         (111..121).for_each(|i| assert!(Board::is_occupied(bob_0, i)));
         // Moving correctly sets the state.
-        let alice_1 = Board::make_move(alice_0, 3, 17);
+        // Note that we support moving to arbitrary places (for test setup).
+        let state_1 = state_0.apply(3, 17);
+        let alice_1 = state_1.adversary();
         assert_eq!(10, alice_1.count_ones());
         assert!(Board::is_occupied(alice_1, 17));
         assert!(!Board::is_occupied(alice_1, 3));
-        // We even support no-op moves (but it's useless).
-        let bob_1 = Board::make_move(bob_0, 113, 113);
+        let state_2 = state_1.apply(113, 97);
+        let bob_1 = state_2.adversary();
         assert_eq!(10, bob_1.count_ones());
-        assert!(Board::is_occupied(bob_1, 113));
+        assert!(Board::is_occupied(bob_1, 97));
+        assert!(!Board::is_occupied(bob_1, 113));
+    }
+
+    #[test]
+    fn starting_position_is_symmetric_and_maximal() {
+        for n in 1..=4 {
+            let board = Board::new(n);
+            let start = board.starting_state();
+            let (d0, d1) = (
+                board.remaining_distance(&start, 0),
+                board.remaining_distance(&start, 1),
+            );
+            assert_eq!(d0, d1, "the start must not favour either player");
+            let moves = board.available_moves(start.mover(), start.adversary());
+            moves.iter().for_each(|&(from, to)| {
+                assert!(board.remaining_distance(&start.apply(from, to), 0) < d0)
+            });
+        }
+    }
+
+    #[test]
+    fn target_is_the_opposite_home() {
+        for n in 1..=4 {
+            let board = Board::new(n);
+            let start = board.starting_state();
+            // Each player's target is exactly where the other player begins.
+            assert_eq!(board.winning_state(0), start.player(1));
+            assert_eq!(board.winning_state(1), start.player(0));
+            assert_eq!(board.winning_state(0) & board.winning_state(1), 0);
+            assert_eq!(
+                board.winning_state(0).count_ones() as usize,
+                board.pieces_per_player()
+            );
+        }
+    }
+
+    /// Helper function that sets the state to occupy the given positions.
+    fn state_from(p0: &[u8], p1: &[u8], side: u8) -> GameState {
+        let mask = |holes: &[u8]| holes.iter().fold(0u128, |m, &i| m | (1u128 << i));
+        let state = GameState {
+            players: [mask(p0), mask(p1)],
+            side,
+        };
+        assert_eq!(
+            state.players[0] & state.players[1],
+            0,
+            "overlapping pieces in fixture"
+        );
+        state
+    }
+
+    #[test]
+    fn game_is_open_at_the_start() {
+        let board = Board::new(2);
+        let start = board.starting_state();
+        assert_eq!(board.outcome(&start, 100), None);
+        assert_eq!(board.outcome_score(&start, 100), None);
+    }
+
+    #[test]
+    fn win_is_detected_and_signed_correctly() {
+        let board = Board::new(2);
+        // Player 0 has filled the top triangle (34, 35, 36); player 1 sits in the middle.
+        // side = 1 because player 0 has just moved.
+        let state = state_from(&[34, 35, 36], &[16, 17, 18], 1);
+        assert_eq!(board.outcome(&state, 100), Some(Outcome::Win(0)));
+        // From the side to move's perspective this is a loss.
+        assert_eq!(board.outcome_score(&state, 100), Some(-1.0));
+        // The win takes precedence over any remaining budget, including none.
+        assert_eq!(board.outcome(&state, 0), Some(Outcome::Win(0)));
+    }
+
+    #[test]
+    fn cap_awards_the_closer_player() {
+        let board = Board::new(2);
+        // Player 0 has advanced up the board; player 1 has barely left home.
+        let advanced = state_from(&[26, 30, 31], &[34, 35, 2], 0);
+        let d0 = board.remaining_distance(&advanced, 0);
+        let d1 = board.remaining_distance(&advanced, 1);
+        assert_ne!(d0, d1, "fixture is a tie; pick different holes");
+        let expected = if d0 < d1 { 0 } else { 1 };
+        assert_eq!(board.outcome(&advanced, 0), Some(Outcome::CapWin(expected)));
+
+        // The sign of the value depends on who is to move, not on who won.
+        let as_mover = state_from(&[26, 30, 31], &[34, 35, 2], expected);
+        let as_waiter = state_from(&[26, 30, 31], &[34, 35, 2], expected ^ 1);
+        assert_eq!(board.outcome_score(&as_mover, 0), Some(1.0));
+        assert_eq!(board.outcome_score(&as_waiter, 0), Some(-1.0));
+
+        // A position symmetric under the rotation must draw.
+        let start = board.starting_state();
+        assert_eq!(board.outcome(&start, 0), Some(Outcome::Draw));
+    }
+
+    #[test]
+    fn refusing_to_leave_home_loses() {
+        // The spoiling strategy: player 1 never moves, so player 0 can never fill the top triangle
+        // and the game ends after rounds have been exhausted.
+        let board = Board::new(2);
+        let mut state = board.starting_state();
+        let mut rng = rand::rng();
+        // Let player 0 shuffle around for a while; player 1 never moves.
+        for _ in 0..40 {
+            if state.side() == 1 {
+                state = GameState {
+                    players: state.players,
+                    side: 0,
+                };
+                continue;
+            }
+            let moves = board.available_moves(state.mover(), state.adversary());
+            let distribution = Uniform::new(0, moves.len()).unwrap();
+            let (from, to) = moves[distribution.sample(&mut rng)];
+            state = state.apply(from, to);
+        }
+        assert_eq!(state.player(1), board.starting_state().player(1));
+        assert_eq!(board.outcome(&state, 0), Some(Outcome::CapWin(0)));
     }
 
     /// Naive, deliberately inefficient move generator used to verify the correctness of the
@@ -869,17 +1163,16 @@ mod tests {
             " -3       A .\n",
             " -4        .\n",
         );
-        let state_0 = g.starting_states();
-        let mut alice = state_0.players[0];
-        alice = Board::make_move(alice, 0, 12);
-        alice = Board::make_move(alice, 1, 18);
-        let mut bob = state_0.players[1];
-        bob = Board::make_move(bob, 34, 17);
-        bob = Board::make_move(bob, 35, 23);
-        bob = Board::make_move(bob, 36, 29);
+        let mut state = g.starting_state();
+        state = state.apply(0, 12);
+        state = state.apply(34, 17);
+        state = state.apply(2, 18);
+        state = state.apply(35, 23);
+        state = state.apply(1, 2);
+        state = state.apply(36, 29);
         let rendered = g.render(|i| match i {
-            i if Board::is_occupied(alice, i as u8) => 'A',
-            i if Board::is_occupied(bob, i as u8) => 'B',
+            i if Board::is_occupied(state.player(0), i as u8) => 'A',
+            i if Board::is_occupied(state.player(1), i as u8) => 'B',
             _ => '.',
         });
         assert_eq!(rendered, SAMPLE_BOARD);
@@ -905,6 +1198,7 @@ mod tests {
         // And also make a few jumps:
         expected_moves.insert((18, 5));
         expected_moves.insert((18, 16));
+        let (alice, bob) = (state.player(0), state.player(1));
         let computed_moves = HashSet::from_iter(g.available_moves(alice, bob));
         assert_eq!(expected_moves, computed_moves);
     }
@@ -914,23 +1208,15 @@ mod tests {
         let board = Board::new(2);
         let mut rng = rand::rng();
         for _ in 0..100 {
-            let [mut a, mut b] = board.starting_states().players;
-            let mut side = 0;
+            let mut state = board.starting_state();
             for _ in 0..60 {
-                let (player, adversary) = if side == 0 { (a, b) } else { (b, a) };
-                assert_move_generators_agree(&board, player, adversary);
-                let moves = board.available_moves(player, adversary);
+                assert_move_generators_agree(&board, state.mover(), state.adversary());
+                let moves = board.available_moves(state.mover(), state.adversary());
                 if moves.is_empty() {
                     break;
                 }
                 let (from, to) = moves[rng.next_u32() as usize % moves.len()];
-                let moved = Board::make_move(player, from, to);
-                if side == 0 {
-                    a = moved
-                } else {
-                    b = moved
-                }
-                side ^= 1;
+                state = state.apply(from, to);
             }
         }
     }
@@ -966,51 +1252,39 @@ mod tests {
         }
     }
 
-    // This test is just a sample to showcase how a random game is played and how win detection
-    // works, with a cap on the number of rounds.
     #[test]
-    fn play_random_game() {
-        let mut rng = rand::rng();
-        let board = Board::new(2);
-        let mut state = board.starting_states();
-        // Each player wins by occupying the other player's starting triangle.
-        let winning_a = state.players[1];
-        let winning_b = state.players[0];
-        // Since players can stall the game by not making any move, we have an upper limit on the
-        // number of rounds: after that, the game is a draw.
-        let mut remaining_rounds: u16 = 10_000;
-        while remaining_rounds > 0 {
-            let player = state.players[state.side as usize];
-            let adversary = state.players[(state.side ^ 1) as usize];
-            let moves = board.available_moves(player, adversary);
-            let distribution = Uniform::new(0, moves.len()).unwrap();
-            let (from, to) = moves[distribution.sample(&mut rng)];
-            let player_after_move = Board::make_move(player, from, to);
-            state.players[state.side as usize] = player_after_move;
-            match state.side {
-                0 if player_after_move == winning_a => {
-                    println!("Player A wins!");
-                    break;
+    fn random_games_terminate_decisively() {
+        for n in [2, 4] {
+            let board = Board::new(n);
+            let cap: u16 = 400; // even, so both players get the same number of moves
+            let mut rng = rand::rng();
+            let (mut settled, mut on_cap, mut drawn) = (0, 0, 0);
+            for _ in 0..200 {
+                let mut state = board.starting_state();
+                let mut remaining_moves = cap;
+                let result = loop {
+                    if let Some(outcome) = board.outcome(&state, remaining_moves) {
+                        break outcome;
+                    }
+                    let moves = board.available_moves(state.mover(), state.adversary());
+                    assert!(
+                        !moves.is_empty(),
+                        "no legal move: a pass rule would be needed"
+                    );
+                    let distribution = Uniform::new(0, moves.len()).unwrap();
+                    let (from, to) = moves[distribution.sample(&mut rng)];
+                    state = state.apply(from, to);
+                    remaining_moves -= 1;
+                };
+                match result {
+                    Outcome::Win(_) => settled += 1,
+                    Outcome::CapWin(_) => on_cap += 1,
+                    Outcome::Draw => drawn += 1,
                 }
-                1 if player_after_move == winning_b => {
-                    println!("Player B wins!");
-                    break;
-                }
-                _ => (),
             }
-            state.side ^= 1;
-            remaining_rounds -= 1;
+            println!("n={n}: {settled} settled, {on_cap} on the cap, {drawn} drawn");
+            // The graded cap exists so that random play still produces a learning signal.
+            assert!(drawn < 50, "too many draws: something is wrong");
         }
-        if remaining_rounds == 0 {
-            println!("The game is a DRAW!");
-        }
-        println!(
-            "{}",
-            board.render(|i| match i {
-                i if Board::is_occupied(state.players[0], i as u8) => 'A',
-                i if Board::is_occupied(state.players[1], i as u8) => 'B',
-                _ => '.',
-            })
-        );
     }
 }
