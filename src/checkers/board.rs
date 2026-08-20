@@ -172,6 +172,21 @@ impl GameState {
             side: self.side ^ 1,
         }
     }
+
+    /// Helper function that sets the state to occupy the given positions (for tests).
+    pub fn state_from(p0: &[u8], p1: &[u8], side: u8) -> GameState {
+        let mask = |holes: &[u8]| holes.iter().fold(0u128, |m, &i| m | (1u128 << i));
+        let state = GameState {
+            players: [mask(p0), mask(p1)],
+            side,
+        };
+        assert_eq!(
+            state.players[0] & state.players[1],
+            0,
+            "overlapping pieces in fixture"
+        );
+        state
+    }
 }
 
 /// How a finished game ended. `Win` and `CapWin` produce the same training target, but keeping them
@@ -504,6 +519,11 @@ impl Board {
             total_distance += self.distance_to_target[player as usize][from as usize] as u32;
         }
         total_distance
+    }
+
+    /// Lattice distance from `hole` to the nearest hole of `player`'s target triangle.
+    pub fn distance_to_target(&self, player: u8, hole: u8) -> u8 {
+        self.distance_to_target[player as usize][hole as usize]
     }
 
     /// All legal moves for `player` as `(from, to)` pairs (optimized implementation using binary
@@ -938,21 +958,6 @@ mod tests {
         }
     }
 
-    /// Helper function that sets the state to occupy the given positions.
-    fn state_from(p0: &[u8], p1: &[u8], side: u8) -> GameState {
-        let mask = |holes: &[u8]| holes.iter().fold(0u128, |m, &i| m | (1u128 << i));
-        let state = GameState {
-            players: [mask(p0), mask(p1)],
-            side,
-        };
-        assert_eq!(
-            state.players[0] & state.players[1],
-            0,
-            "overlapping pieces in fixture"
-        );
-        state
-    }
-
     #[test]
     fn game_is_open_at_the_start() {
         let board = Board::new(2);
@@ -966,7 +971,7 @@ mod tests {
         let board = Board::new(2);
         // Player 0 has filled the top triangle (34, 35, 36); player 1 sits in the middle.
         // side = 1 because player 0 has just moved.
-        let state = state_from(&[34, 35, 36], &[16, 17, 18], 1);
+        let state = GameState::state_from(&[34, 35, 36], &[16, 17, 18], 1);
         assert_eq!(board.outcome(&state, 100), Some(Outcome::Win(0)));
         // From the side to move's perspective this is a loss.
         assert_eq!(board.outcome_score(&state, 100), Some(-1.0));
@@ -978,7 +983,7 @@ mod tests {
     fn cap_awards_the_closer_player() {
         let board = Board::new(2);
         // Player 0 has advanced up the board; player 1 has barely left home.
-        let advanced = state_from(&[26, 30, 31], &[34, 35, 2], 0);
+        let advanced = GameState::state_from(&[26, 30, 31], &[34, 35, 2], 0);
         let d0 = board.remaining_distance(&advanced, 0);
         let d1 = board.remaining_distance(&advanced, 1);
         assert_ne!(d0, d1, "fixture is a tie; pick different holes");
@@ -986,8 +991,8 @@ mod tests {
         assert_eq!(board.outcome(&advanced, 0), Some(Outcome::CapWin(expected)));
 
         // The sign of the value depends on who is to move, not on who won.
-        let as_mover = state_from(&[26, 30, 31], &[34, 35, 2], expected);
-        let as_waiter = state_from(&[26, 30, 31], &[34, 35, 2], expected ^ 1);
+        let as_mover = GameState::state_from(&[26, 30, 31], &[34, 35, 2], expected);
+        let as_waiter = GameState::state_from(&[26, 30, 31], &[34, 35, 2], expected ^ 1);
         assert_eq!(board.outcome_score(&as_mover, 0), Some(1.0));
         assert_eq!(board.outcome_score(&as_waiter, 0), Some(-1.0));
 
